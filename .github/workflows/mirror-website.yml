@@ -21,23 +21,19 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
-      
       - name: Install Playwright
         run: |
           npm init -y
           npm install playwright
           npx playwright install chromium
 
-
-      - name: Create website crawler
+      - name: Create crawler
         shell: bash
         run: |
           cat > mirror.mjs <<'EOF'
@@ -49,14 +45,15 @@ jobs:
           const start = "https://d2mxyt8j2p6hed.cloudfront.net/";
           const origin = new URL(start).origin;
           const root = process.cwd();
-          const visited = new Set();
           const queue = [start];
+          const visited = new Set();
           const resources = new Map();
+          const pending = new Set();
           const maxPages = 40;
 
           function destination(raw) {
-            const url = new URL(raw);
-            let pathname = decodeURIComponent(url.pathname);
+            const u = new URL(raw);
+            let pathname = decodeURIComponent(u.pathname);
 
             if (!pathname || pathname.endsWith("/")) {
               pathname += "index.html";
@@ -65,35 +62,34 @@ jobs:
             pathname = pathname.replace(/^\/+/, "");
 
             if (
-              pathname.split("/").some(part =>
-                part === "." || part === ".."
+              pathname.split("/").some(
+                p => p === "." || p === ".."
               ) ||
-              pathname.startsWith(".git/") ||
-              pathname === ".git"
+              pathname === ".git" ||
+              pathname.startsWith(".git/")
             ) {
-              throw new Error("Unsafe resource path");
+              throw new Error("Unsafe path");
             }
 
             let relative = pathname;
 
-            // Keep external resources in the repository too,
-            // without mixing their paths with the main website.
-            if (url.origin !== origin) {
+            if (u.origin !== origin) {
               relative = path.posix.join(
                 "_external",
-                url.host,
+                u.host,
                 pathname
               );
             }
 
-            if (url.search) {
+            if (u.search) {
               const ext = path.posix.extname(relative);
               const base = relative.slice(
-                0, relative.length - ext.length
+                0,
+                relative.length - ext.length
               );
               const hash = crypto
                 .createHash("sha256")
-                .update(url.search)
+                .update(u.search)
                 .digest("hex")
                 .slice(0, 12);
 
@@ -102,10 +98,7 @@ jobs:
 
             const absolute = path.resolve(root, relative);
 
-            if (
-              absolute !== root &&
-              !absolute.startsWith(root + path.sep)
-            ) {
+            if (!absolute.startsWith(root + path.sep)) {
               throw new Error("Path outside repository");
             }
 
@@ -113,26 +106,40 @@ jobs:
           }
 
           async function save(url, body, type) {
-            let file;
+            const parsed = new URL(url);
 
-            try {
-              file = destination(url);
-            } catch (error) {
-              console.log("Skipped path:", url, String(error));
+            // Don't save application routes as extensionless files.
+            // Vercel will route these paths to index.html.
+            if (
+              /text\/html/i.test(type || "") &&
+              parsed.origin === origin &&
+              parsed.pathname !== "/" &&
+              !parsed.pathname.endsWith(".html")
+            ) {
+              console.log(
+                "Skipping HTML route file:",
+                parsed.pathname
+              );
               return;
             }
+
+            const file = destination(url);
 
             await fs.mkdir(path.dirname(file), {
               recursive: true
             });
 
             await fs.writeFile(file, body);
+
             resources.set(url, {
               file,
               type: type || ""
             });
 
-            console.log("Saved:", path.relative(root, file));
+            console.log(
+              "Saved:",
+              path.relative(root, file)
+            );
           }
 
           const browser = await chromium.launch({
@@ -142,42 +149,47 @@ jobs:
           const context = await browser.newContext();
           const page = await context.newPage();
 
-          page.setDefaultTimeout(15000);
+          page.on("response", response => {
+            const task = (async () => {
+              try {
+                if (response.status() !== 200) return;
 
-          page.on("response", async response => {
-            try {
-              if (response.status() !== 200) return;
+                const url = response.url();
 
-              const url = response.url();
+                if (!/^https?:\/\//i.test(url)) return;
 
-              if (!/^https?:\/\//i.test(url)) return;
+                const headers = await response.allHeaders();
+                const type = headers["content-type"] || "";
 
-              const headers = await response.allHeaders();
-              const type = headers["content-type"] || "";
+                if (!/(text\/html|text\/css|javascript|json|image\/|font\/|application\/wasm|application\/octet-stream)/i.test(type)) {
+                  return;
+                }
 
-              if (!/(text\/html|text\/css|javascript|json|image\/|font\/|application\/wasm|application\/octet-stream)/i.test(type)) {
-                return;
+                const body = await response.body();
+                await save(url, body, type);
+              } catch (error) {
+                console.log(
+                  "Resource skipped:",
+                  response.url(),
+                  String(error).slice(0, 150)
+                );
               }
+            })();
 
-              const body = await response.body();
-
-              await save(url, body, type);
-            } catch (error) {
-              console.log(
-                "Resource unavailable:",
-                response.url(),
-                String(error).slice(0, 150)
-              );
-            }
+            pending.add(task);
+            task.finally(() => pending.delete(task));
           });
 
-          while (queue.length && visited.size < maxPages) {
+          while (
+            queue.length > 0 &&
+            visited.size < maxPages
+          ) {
             const url = queue.shift();
 
             if (visited.has(url)) continue;
             visited.add(url);
 
-            console.log("Crawling:", url);
+            console.log("Visiting:", url);
 
             try {
               await page.goto(url, {
@@ -185,22 +197,24 @@ jobs:
                 timeout: 45000
               });
 
-              // Give client-side JavaScript time to load assets.
-              await page.waitForTimeout(4000);
+              await page.waitForTimeout(2500);
 
               const html = await page.content();
-              await save(
-                url,
-                Buffer.from(html),
-                "text/html"
-              );
 
+              // Save the actual homepage at the repository root.
+              if (url === start) {
+                await fs.writeFile(
+                  path.join(root, "index.html"),
+                  html
+                );
+              }
+
+              // Collect normal navigation links and iframe URLs.
               const links = await page.locator(
                 "a[href], iframe[src]"
               ).evaluateAll(elements =>
-                elements.map(element =>
-                  element.href || element.src
-                ).filter(Boolean)
+                elements.map(el => el.href || el.src)
+                  .filter(Boolean)
               );
 
               for (const link of links) {
@@ -226,19 +240,25 @@ jobs:
             }
           }
 
+          // Wait for response handlers to finish saving files.
+          await Promise.allSettled([...pending]);
           await browser.close();
 
-          // Rewrite captured absolute resource URLs to local files.
-          // Files retain their paths relative to the repository root.
+          // Rewrite captured absolute URLs in HTML and CSS only.
+          // JavaScript files are left untouched to avoid breaking
+          // client-side navigation and download handlers.
           for (const [url, resource] of resources) {
-            if (!/(text\/html|text\/css|javascript)/i.test(resource.type)) {
+            if (!/(text\/html|text\/css)/i.test(resource.type)) {
               continue;
             }
 
             let content;
 
             try {
-              content = await fs.readFile(resource.file, "utf8");
+              content = await fs.readFile(
+                resource.file,
+                "utf8"
+              );
             } catch {
               continue;
             }
@@ -261,48 +281,45 @@ jobs:
             await fs.writeFile(resource.file, content);
           }
 
-          // Ensure the requested homepage is at the repository root.
-          const homepage = resources.get(start);
-
-          if (homepage) {
-            const source = await fs.readFile(homepage.file);
-            await fs.writeFile(
-              path.join(root, "index.html"),
-              source
-            );
-          } else {
-            throw new Error(
-              "Homepage was not captured. Check the crawl logs."
-            );
-          }
-
-          console.log("--------------------------------");
           console.log("Pages visited:", visited.size);
-          console.log("Resources captured:", resources.size);
-          console.log("Mirror destination: repository root");
-          console.log("--------------------------------");
+          console.log("Resources saved:", resources.size);
+          console.log("Homepage:", path.join(root, "index.html"));
+
+          if (!(await fs.stat(
+            path.join(root, "index.html")
+          )).isFile()) {
+            throw new Error("Homepage was not created.");
+          }
           EOF
 
-      - name: Crawl and mirror website
+      - name: Crawl website
         run: node mirror.mjs
 
-      - name: Verify downloaded files
+      - name: Remove duplicate route files
+        shell: bash
         run: |
-          echo "=== Root homepage ==="
+          # Only remove generated files when their contents
+          # exactly match the main index.html.
+          for file in ai settings terms privacy credits bookmarks history; do
+            if [ -f "$file" ] && cmp -s index.html "$file"; then
+              rm "$file"
+              echo "Removed duplicate route: $file"
+            fi
+          done
+
+      - name: Verify mirror
+        run: |
           test -s index.html
+
+          echo "=== Homepage ==="
           ls -lh index.html
 
           echo "=== File count ==="
           find . -type f \
             ! -path './.git/*' \
-            ! -path './node_modules/*' \
-            | wc -l
+            ! -path './node_modules/*' | wc -l
 
-          echo "=== Downloaded assets ==="
-          find assets css js images fonts _external \
-            -type f 2>/dev/null | head -100 || true
-
-          echo "=== Root directory ==="
+          echo "=== Root files ==="
           ls -la
 
       - name: Commit mirrored files
@@ -311,14 +328,13 @@ jobs:
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -f -A
-
-          # Keep workflow and crawler source under version control
-          # without accidentally committing generated package files.
+          # Don't publish dependencies or crawler source.
+          rm -rf node_modules
+          git add -A
           git reset -- mirror.mjs package.json package-lock.json
 
           if git diff --cached --quiet; then
-            echo "No mirror changes to commit."
+            echo "No changes to commit."
           else
             git commit -m "Update website mirror"
             git push
