@@ -1,8 +1,10 @@
 
-name: Mirror Website with Playwright
+name: Mirror Website to Repository Root
 
 on:
   workflow_dispatch:
+  schedule:
+    - cron: "0 5 * * 1"
 
 permissions:
   contents: write
@@ -19,6 +21,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -31,7 +35,8 @@ jobs:
           npm install playwright
           npx playwright install --with-deps chromium
 
-      - name: Create crawler
+      - name: Create website crawler
+        shell: bash
         run: |
           cat > mirror.mjs <<'EOF'
           import { chromium } from "playwright";
@@ -41,69 +46,109 @@ jobs:
 
           const start = "https://d2mxyt8j2p6hed.cloudfront.net/";
           const origin = new URL(start).origin;
-          const output = path.resolve("site");
-          const seenPages = new Set();
-          const saved = new Map();
+          const root = process.cwd();
+          const visited = new Set();
           const queue = [start];
+          const resources = new Map();
+          const maxPages = 40;
 
-          function localPath(raw) {
-            const u = new URL(raw);
-            let pathname = decodeURIComponent(u.pathname);
+          function destination(raw) {
+            const url = new URL(raw);
+            let pathname = decodeURIComponent(url.pathname);
+
             if (!pathname || pathname.endsWith("/")) {
               pathname += "index.html";
             }
 
             pathname = pathname.replace(/^\/+/, "");
-            if (pathname.split("/").some(p => p === "..")) {
-              throw new Error("Unsafe path");
+
+            if (
+              pathname.split("/").some(part =>
+                part === "." || part === ".."
+              ) ||
+              pathname.startsWith(".git/") ||
+              pathname === ".git"
+            ) {
+              throw new Error("Unsafe resource path");
             }
 
-            let dest = path.join(
-              output, "_mirror", u.hostname, pathname
-            );
+            let relative = pathname;
 
-            if (u.search) {
+            // Keep external resources in the repository too,
+            // without mixing their paths with the main website.
+            if (url.origin !== origin) {
+              relative = path.posix.join(
+                "_external",
+                url.host,
+                pathname
+              );
+            }
+
+            if (url.search) {
+              const ext = path.posix.extname(relative);
+              const base = relative.slice(
+                0, relative.length - ext.length
+              );
               const hash = crypto
                 .createHash("sha256")
-                .update(u.search)
+                .update(url.search)
                 .digest("hex")
                 .slice(0, 12);
-              dest += "." + hash;
+
+              relative = `${base}.${hash}${ext}`;
             }
 
-            return dest;
+            const absolute = path.resolve(root, relative);
+
+            if (
+              absolute !== root &&
+              !absolute.startsWith(root + path.sep)
+            ) {
+              throw new Error("Path outside repository");
+            }
+
+            return absolute;
           }
 
-          async function writeResponse(url, body, contentType) {
-            let dest;
+          async function save(url, body, type) {
+            let file;
+
             try {
-              dest = localPath(url);
-            } catch {
+              file = destination(url);
+            } catch (error) {
+              console.log("Skipped path:", url, String(error));
               return;
             }
 
-            await fs.mkdir(path.dirname(dest), { recursive: true });
-            await fs.writeFile(dest, body);
-            saved.set(url, { dest, contentType });
+            await fs.mkdir(path.dirname(file), {
+              recursive: true
+            });
+
+            await fs.writeFile(file, body);
+            resources.set(url, {
+              file,
+              type: type || ""
+            });
+
+            console.log("Saved:", path.relative(root, file));
           }
 
           const browser = await chromium.launch({
             headless: true
           });
 
-          const context = await browser.newContext({
-            ignoreHTTPSErrors: false
-          });
-
+          const context = await browser.newContext();
           const page = await context.newPage();
+
           page.setDefaultTimeout(15000);
 
           page.on("response", async response => {
             try {
-              const url = response.url();
-              const status = response.status();
+              if (response.status() !== 200) return;
 
-              if (!url.startsWith("http") || status !== 200) return;
+              const url = response.url();
+
+              if (!/^https?:\/\//i.test(url)) return;
 
               const headers = await response.allHeaders();
               const type = headers["content-type"] || "";
@@ -113,18 +158,24 @@ jobs:
               }
 
               const body = await response.body();
-              await writeResponse(url, body, type);
-            } catch (e) {
-              console.log("Resource skipped:", response.url(), String(e).slice(0, 120));
+
+              await save(url, body, type);
+            } catch (error) {
+              console.log(
+                "Resource unavailable:",
+                response.url(),
+                String(error).slice(0, 150)
+              );
             }
           });
 
-          while (queue.length && seenPages.size < 30) {
+          while (queue.length && visited.size < maxPages) {
             const url = queue.shift();
-            if (seenPages.has(url)) continue;
-            seenPages.add(url);
 
-            console.log("Opening:", url);
+            if (visited.has(url)) continue;
+            visited.add(url);
+
+            console.log("Crawling:", url);
 
             try {
               await page.goto(url, {
@@ -132,142 +183,141 @@ jobs:
                 timeout: 45000
               });
 
-              await page.waitForTimeout(5000);
+              // Give client-side JavaScript time to load assets.
+              await page.waitForTimeout(4000);
 
-              const links = await page.locator("a[href]")
-                .evaluateAll(nodes =>
-                  nodes.map(a => a.href).filter(Boolean)
-                );
+              const html = await page.content();
+              await save(
+                url,
+                Buffer.from(html),
+                "text/html"
+              );
+
+              const links = await page.locator(
+                "a[href], iframe[src]"
+              ).evaluateAll(elements =>
+                elements.map(element =>
+                  element.href || element.src
+                ).filter(Boolean)
+              );
 
               for (const link of links) {
                 try {
-                  const u = new URL(link);
-                  u.hash = "";
+                  const next = new URL(link);
+                  next.hash = "";
 
                   if (
-                    u.origin === origin &&
-                    !seenPages.has(u.href) &&
-                    queue.length < 100
+                    next.origin === origin &&
+                    !visited.has(next.href) &&
+                    queue.length < 200
                   ) {
-                    queue.push(u.href);
+                    queue.push(next.href);
                   }
                 } catch {}
               }
-
-              const html = await page.content();
-
-              if (url === start) {
-                await fs.writeFile(
-                  path.join(output, "index.html"),
-                  html
-                );
-              } else {
-                await writeResponse(
-                  url,
-                  Buffer.from(html),
-                  "text/html"
-                );
-              }
-            } catch (e) {
-              console.log("Page failed:", url, String(e).slice(0, 200));
+            } catch (error) {
+              console.log(
+                "Page failed:",
+                url,
+                String(error).slice(0, 200)
+              );
             }
           }
 
           await browser.close();
 
-          // Rewrite absolute URLs for resources that were captured.
-          // Keep the original directory hierarchy under _mirror/.
-          const all = [...saved.entries()].sort(
-            (a, b) => b[0].length - a[0].length
-          );
-
-          async function rewriteFile(file, baseUrl) {
-            let content;
-            try {
-              content = await fs.readFile(file, "utf8");
-            } catch {
-              return;
+          // Rewrite captured absolute resource URLs to local files.
+          // Files retain their paths relative to the repository root.
+          for (const [url, resource] of resources) {
+            if (!/(text\/html|text\/css|javascript)/i.test(resource.type)) {
+              continue;
             }
 
-            if (content.includes("\u0000")) return;
+            let content;
 
-            for (const [url, item] of all) {
-              if (!/^https?:\/\//i.test(url)) continue;
+            try {
+              content = await fs.readFile(resource.file, "utf8");
+            } catch {
+              continue;
+            }
 
-              let relative = path.relative(
-                path.dirname(file), item.dest
+            if (content.includes("\u0000")) continue;
+
+            for (const [original, target] of resources) {
+              const relative = path.relative(
+                path.dirname(resource.file),
+                target.file
               ).split(path.sep).join("/");
 
-              if (!relative.startsWith(".")) relative = "./" + relative;
+              const local = relative.startsWith(".")
+                ? relative
+                : "./" + relative;
 
-              content = content.split(url).join(relative);
+              content = content.split(original).join(local);
             }
 
-            // Rewrite root-relative resource references in HTML and CSS.
-            content = content.replace(
-              /(["'(=:\s])\/(?!\/)([^"'()\s<>]*)/g,
-              (match, prefix, resource) => {
-                try {
-                  const absolute = new URL("/" + resource, baseUrl).href;
-                  const item = saved.get(absolute);
-                  if (!item) return match;
+            await fs.writeFile(resource.file, content);
+          }
 
-                  let relative = path.relative(
-                    path.dirname(file), item.dest
-                  ).split(path.sep).join("/");
+          // Ensure the requested homepage is at the repository root.
+          const homepage = resources.get(start);
 
-                  if (!relative.startsWith(".")) relative = "./" + relative;
-                  return prefix + relative;
-                } catch {
-                  return match;
-                }
-              }
+          if (homepage) {
+            const source = await fs.readFile(homepage.file);
+            await fs.writeFile(
+              path.join(root, "index.html"),
+              source
             );
-
-            await fs.writeFile(file, content);
+          } else {
+            throw new Error(
+              "Homepage was not captured. Check the crawl logs."
+            );
           }
 
-          for (const [url, item] of all) {
-            if (/text\/(html|css)|javascript/i.test(item.contentType)) {
-              await rewriteFile(item.dest, url);
-            }
-          }
-
-          const files = await fs.readdir(output, {
-            recursive: true
-          });
-
-          console.log("Pages visited:", seenPages.size);
-          console.log("Responses captured:", saved.size);
-          console.log("Files in mirror:", files.length);
-          console.log("Homepage:", path.join(output, "index.html"));
+          console.log("--------------------------------");
+          console.log("Pages visited:", visited.size);
+          console.log("Resources captured:", resources.size);
+          console.log("Mirror destination: repository root");
+          console.log("--------------------------------");
           EOF
 
-      - name: Run browser crawler
+      - name: Crawl and mirror website
         run: node mirror.mjs
 
-      - name: Verify mirror
+      - name: Verify downloaded files
         run: |
-          echo "=== Downloaded file count ==="
-          find site -type f | wc -l
+          echo "=== Root homepage ==="
+          test -s index.html
+          ls -lh index.html
 
-          echo "=== Largest files ==="
-          du -ah site | sort -h | tail -30
+          echo "=== File count ==="
+          find . -type f \
+            ! -path './.git/*' \
+            ! -path './node_modules/*' \
+            | wc -l
 
-          echo "=== HTML files ==="
-          find site -type f -name '*.html' | head -50
+          echo "=== Downloaded assets ==="
+          find assets css js images fonts _external \
+            -type f 2>/dev/null | head -100 || true
 
-          test -s site/index.html
+          echo "=== Root directory ==="
+          ls -la
 
-      - name: Commit mirror
+      - name: Commit mirrored files
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f site/ mirror.mjs
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -f -A
+
+          # Keep workflow and crawler source under version control
+          # without accidentally committing generated package files.
+          git reset -- mirror.mjs package.json package-lock.json
 
           if git diff --cached --quiet; then
-            echo "No changes to commit."
+            echo "No mirror changes to commit."
           else
-            git commit -m "Mirror website and capture browser assets"
+            git commit -m "Update website mirror"
             git push
           fi
