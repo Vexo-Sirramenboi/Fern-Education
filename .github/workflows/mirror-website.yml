@@ -1,0 +1,78 @@
+
+name: Mirror LinguaPath Website
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: website-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install wget
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget
+
+      - name: Crawl and download website
+        run: |
+          mkdir -p site
+
+          wget \
+            --recursive \
+            --level=5 \
+            --page-requisites \
+            --convert-links \
+            --adjust-extension \
+            --no-parent \
+            --no-host-directories \
+            --directory-prefix=site \
+            --domains=d2mxyt8j2p6hed.cloudfront.net \
+            --wait=1 \
+            --random-wait \
+            --limit-rate=1m \
+            --tries=2 \
+            --timeout=20 \
+            --execute robots=on \
+            --user-agent="VEXO-Website-Mirror/1.0" \
+            https://d2mxyt8j2p6hed.cloudfront.net/ \
+            || echo "Crawl finished with some unavailable resources."
+
+          echo "Downloaded files:"
+          find site -type f | sort
+
+      - name: Verify downloaded content
+        run: |
+          if [ ! -s site/index.html ]; then
+            echo "ERROR: No root index.html was downloaded."
+            find site -maxdepth 3 -type f
+            exit 1
+          fi
+
+          echo "Homepage downloaded successfully."
+          du -sh site
+
+      - name: Commit mirror
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -f site/
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Update website mirror"
+            git push
+          fi
