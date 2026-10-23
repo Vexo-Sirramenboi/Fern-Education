@@ -29,11 +29,13 @@ jobs:
         with:
           node-version: 20
 
+      
       - name: Install Playwright
         run: |
           npm init -y
           npm install playwright
-          npx playwright install --with-deps chromium
+          npx playwright install chromium
+
 
       - name: Create website crawler
         shell: bash
